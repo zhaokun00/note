@@ -1,0 +1,1491 @@
+### kernel流程分析
+
+#### 1. makef uImage是如何编译内核及Makefile[参考链接](https://www.cnblogs.com/lifexy/category/1032343.html)
+
+##### 1.1整个内核的Makefile分成3类(makefile资料文档在linux-2.6.22.6/Documentation/build/makefiles.txt)
+
+```shell
+(1)顶层目录Makefile
+(2)各级子目录Makefile(每个子目录都有Makefile)
+(3)arch/${cpu}/Makefile（架构相关的Makefile）
+```
+
+在顶层目录Makefile中auto.conf和arch/${cpu}/Makefile又被包含进去
+
+```makefile
+#架构相关的makefile
+413 include $(srctree)/arch/$(SRCARCH)/Makefile 
+
+#为编译生成的文件,里面定义了配置选项,该文件中的变量为.config文件提供帮助
+443 include include/config/auto.conf
+
+#auto.conf内容如下
+#
+# Automatically generated make config: don't edit
+# Linux kernel version: 2.6.22.6
+# Sun Feb 23 16:01:05 2020
+#
+CONFIG_CPU_S3C244X=y
+CONFIG_CPU_COPY_V4WB=y
+CONFIG_DEBUG_USER=y
+CONFIG_MMC_S3C=y
+..............
+```
+
+##### 1.2 分析子目录Makefile
+
+随便打开一个子目录makefile,可以看到类似的内容
+
+```makefile
+obj-y  += mem.o random.o tty_io.o n_tty.o tty_ioctl.o
+
+obj-m    += s3c24xx_leds.o
+
+obj-m    += s3c24xx_buttons.o
+
+obj-m    += ker_rw.o
+
+obj-$(CONFIG_LEGACY_PTYS) += pty.o
+
+obj-$(CONFIG_UNIX98_PTYS) += pty.o
+```
+
+在makefile资料文档中得到(linux-2.6.22.6/Documentation/build/makefiles.txt)
+
+```makefile
+--- 3.2 Built-in object goals - obj-y            
+
+41~59 ....
+Example:
+  #drivers/isdn/i4l/Makefile
+  # Makefile for the kernel ISDN subsystem and device drivers.
+  # Each configuration option enables a list of files.
+  obj-$(CONFIG_ISDN)             += isdn.o
+  obj-$(CONFIG_ISDN_PPP_BSDCOMP) += isdn_bsdcomp.o
+  
+#总结:
+从上面第40行得出要追加built-in.o文件(编译进内核)时,使用obj-y
+
+例如:     obj-y += isdn.o   
+         obj-y+= isdn_bsdcomp.o
+最后直接编译进内核
+```
+
+```makefile
+--- 3.3 Loadable module goals - obj-m
+
+168~188 ...
+Example:
+ #drivers/isdn/i4l/Makefile
+ obj-$(CONFIG_ISDN) += isdn.o
+ isdn-objs := isdn_net_lib.o isdn_v110.o isdn_common.o
+ 
+ #总结:
+ 从上面第167行得出加载模块.ok文件时,使用obj-m
+
+例如: obj-m += isdn.o
+     isdn-objs: = isdn_net_lib.o isdn_v110.o isdn_common.o
+最后编译成isdn.ko模块文件
+```
+
+```shell
+在配置文件auto.conf中CONFIG_XXX=y， 那么编译时,源码.o文件会被Makefile追加到built-in.o文件,供给顶层Makefile生成内核
+在配置文件auto.conf中CONFIG_XXX=m，那么编译时, 源码.o文件会被Makefile编译成模块XXX.ko文件；
+在配置文件auto.conf中CONFIG_XXX=n， 那么编译时,对应的源码文件不会被makefile编译；
+```
+
+##### 1.3 分析arch/arm/Makefile
+
+在./arch/arm/Makefile文件第227行得到:
+
+```makefile
+227 zImage Image xipImage bootpImage uImage: vmlinux
+
+228 $(Q)$(MAKE) $(build)=$(boot) MACHINE=$(MACHINE) $(boot)/$@
+```
+
+得出uImage等5个目标的生成都是依赖于**vmlinux**(vmlinux位于顶层makefile,其中vmlinux 指未压缩的内核，不能直接加载)。由于,我们在顶层目录下执行make uImage,但是uImage在./arch/arm/Makefile,
+
+在顶层makefile中第413行可以看到:
+
+```makefile
+413 include $(srctree)/arch/$(SRCARCH)/Makefile 
+```
+
+由于打上补丁后, SRCARCH=arm
+
+所以这个./arch/arm/Makefile被顶层makefile包含,然后调用了./arch/arm/Makefile中的uImage
+
+##### 1.4 分析顶层Makefile
+
+a.顶层vmlinux生成过程
+
+在顶层目录makefile中第484行得出:
+
+```makefile
+484 all: vmlinux
+```
+
+其中,all就是直接 make 指令编译内核,显然make uImage和make都依赖于vmlinux(内核)
+
+然后在746得到出vmlinux生成步骤:
+
+```makefile
+746 vmlinux: $(vmlinux-lds) $(vmlinux-init) $(vmlinux-main) $(kallsyms.o) FORCE
+```
+
+可以看出vmlinux依赖于:
+
+```makefile
+vmlinux-lds： 链接脚本
+vmlinux-init： 初始化相关的代码
+vmlinux-main：核心代码
+kallsyms.o：  变量
+```
+
+这些依赖在顶层Makefile中608行处定义：
+
+```makefile
+608 vmlinux-init := $(head-y) $(init-y)                        # head-y:头文件   init-y:初始化文件 
+
+609 vmlinux-main := $(core-y) $(libs-y) $(drivers-y) $(net-y)  # core-y:核心文件libs-y:库文件  drivers-y:驱动文件net-y:网络文件
+
+611 vmlinux-lds := arch/$(SRCARCH)/kernel/vmlinux.lds        #arch/arm/kernel/vmlinux.lds链接脚本
+```
+
+**a. 分析vmlinux-lds**
+
+因为我们是使用的arm架构,$(SRCARCH) = arm，因此 vmlinux-lds :=arch/arm/kernel/vmlinux.lds
+
+首先查看arch/arm/kernel/vmlinux.lds文件，如下所示,在288行处设置了内核运行在虚拟地址0Xc0008000处，接下来按顺序存放vmlinux的依赖文件
+
+```makefile
+SECTIONS
+
+{
+
+. = (0xc0000000) + 0x00008000;          #设置内核运行地址,并且在uboot将内核就加载到该处
+
+ .text.head : {                           
+
+  _stext = .;
+
+  _sinittext = .;
+
+*(.text.head)                     		#存放.text.head段
+
+}
+
+.init : {
+*(.init.text)                    		#存放.init.text段   
+
+...   ...
+```
+
+**b. vmlinux-init**
+head-y在/arch/arm/makefile中94行处定义：
+
+```makefile
+94 head-y := arch/arm/kernel/head$(MMUEXT).o  arch/arm/kernel/init_task.o
+```
+
+由于MMUEXT没有定义 ，所以变量head-y 应为 head-y := arch/arm/kernel/head.o   arch/arm/kernel/init_task.o,init-y在顶层makefile中427行中定义：
+
+```makefile
+427 init-y    := init/
+```
+
+然后在532行中修改init-y
+
+```makefile
+532 init-y    := $(patsubst %/, %/built-in.o, $(init-y))
+```
+
+这里的patsubst 是实现匹配替换的，在这里将$(init-y) 中的 / 替换为'/built-in.o' 。
+
+所以变量init-y 应为  
+
+init-y     := init/built-in.o
+
+因此vmlinux-init := arch/arm/kernel/head.o  arch/arm/kernel/init_task.o  init/built-in.o
+
+**c. vmlinux-main**
+
+core-y 在顶层Makefile中438行定义,在562行处追加,在574行处修改:
+
+```makefile
+438 core-y    := usr/
+
+562 core-y    += kernel/ mm/ fs/ ipc/ security/ crypto/ block/
+
+574 core-y    := $(patsubst %/, %/built-in.o, $(core-y))   //将$(core-y)中的  的/ 替换为'/built-in.o' 。
+```
+
+所以变量core-y 应为  
+
+core-y := usr/ built-in.o kernel/ built-in.o  mm/ fs/ built-in.o  ipc/ built-in.o security/ built-in.o crypto/ built-in.o  block/ built-in.o
+
+libs-y 在顶层Makefile中437行定义,然后后面577行进行修改:
+
+```makefile
+437 libs-y    := lib/
+
+577 libs-y1    := $(patsubst %/, %/lib.a, $(libs-y))        # libs-y1:= lib/ lib.a
+
+578 libs-y2    := $(patsubst %/, %/built-in.o, $(libs-y))   # libs-y2:= lib/ built-in.o
+
+579 libs-y    := $(libs-y1) $(libs-y2)                  	# libs-y:= lib/ lib.a   lib/ built-in.o
+```
+
+所以变量libs-y 应为
+
+libs-y:= lib/ lib.a  lib/ built-in.o
+
+core-y 在顶层Makefile中435行定义,在574行处修改:
+
+```
+435 drivers-y    := drivers/ sound/
+
+475 drivers-y    := $(patsubst %/, %/built-in.o, $(drivers-y)
+```
+
+所以变量drivers-y 应为
+
+drivers-y := drivers/ built-in.o  sound/ built-in.o   
+
+net-y 在顶层Makefile中436行定义,在575行处修改:
+
+```makefile
+436 net-y    := net/
+
+576 net-y    := $(patsubst %/, %/built-in.o, $(net-y))   
+```
+
+所以变量net-y 应为
+
+net-y := net/ built-in.o  
+
+**因此  vmlinux-main ：=** **usr/** **built-in.o** **kernel/** **built-in.o** **mm/ fs/** **built-in.o** **ipc/** **built-in.o** **security/** **built-in.o** **crypto/** **built-in.o** **block/** **built-in.o**  
+
+​         **lib/ lib.a**  **lib/ built-in.o**
+
+​         **drivers/ built-in.o**  **sound/ built-in****.o**  
+
+​         **net/ built-in.o**  
+
+```shell
+总结：
+	根据makefile中最终确定了生成的目标以及生成目标所依赖的文件
+```
+
+##### 1.5 顶层vmlinux生成规则分析
+
+```SHELL
+(1)首先rm vmlinux 删除目标文件，再make uImage V=1   (V=1表示显示详细编译过程 ) 
+
+arm-linux-ld -EL  -p --no-undefined -X -o vmlinux -T arch/arm/kernel/vmlinux.lds arch/arm/kernel/head.o arch/arm/kernel/init_task.o  init/built-in.o --start-group  usr/built-in.o  arch/arm/kernel/built-in.o  arch/arm/mm/built-in.o  arch/arm/common/built-in.o  arch/arm/mach-s3c2410/built-in.o  arch/arm/mach-s3c2400/built-in.o  arch/arm/mach-s3c2412/built-in.o  arch/arm/mach-s3c2440/built-in.o  arch/arm/mach-s3c2442/built-in.o  arch/arm/mach-s3c2443/built-in.o  arch/arm/nwfpe/built-in.o  arch/arm/plat-s3c24xx/built-in.o  kernel/built-in.o  mm/built-in.o  fs/built-in.o  ipc/built-in.o  security/built-in.o  crypto/built-in.o  block/built-in.o  arch/arm/lib/lib.a  lib/lib.a  arch/arm/lib/built-in.o  lib/built-in.o  drivers/built-in.o  sound/built-in.o  net/built-in.o --end-group .tmp_kallsyms2.o
+
+主要通过arm-linux-ld连接选项，通过vmlinux.lds链接脚本对内存的地址设置,然后将 顶层vmlinux依赖文件分析出来的所有文件按一定顺序布局并输出vmlinux文件
+
+```
+
+#### 2. stext启动内核函数分析
+
+stext是如何启动内核的
+
+```
+1.关闭irq和fiq,设置svc管理模式
+2.判断是否支持这个cpu
+3.判断是否支持这个单板(通过uboot传入的机器ID判断)
+4.创建页表,为后面的MMU做准备
+5.使能MMU,并跳转到__switch_data处，复制数据段，清除bss段，设置栈,调用start_kernel第一个C函数
+```
+
+##### 2.1 uboot中的do_boot_linux函数分析
+
+```c
+theKernel = (void (*)(int, int, unsigend int))0x30008000;
+
+// 设置theKernel地址=0x30008000,用于后面启动内核
+
+/*设置atag参数*/
+
+setup_start_tag (void);                      //从0X30000100地址处开始保存start_tag数据，
+
+setup_memory_tags (void);         //保存memory_tag数据,让内核知道内存多大 setup_commandline_tag (“boottargs=noinitrd root=/dev/mtdblock3 init=/linuxrc console=ttySAC0”);  
+
+ /*保存命令行bootargs参数,让内核知道根文件系统位置在/dev/mtdblock3,指定开机运行第一个脚本/linuxrc,指定打印串口0*/
+
+setup_end_tag (void);                        //初始化tag结构体结束
+
+theKernel(0,362,0x300000100);        //362:机器ID，  0x300000100: params(atag)参数地址
+
+/*传递参数跳转执行到0x30008000启动内核,           */
+
+/*相当于: mov r0,#0                                */
+
+/*ldr r1,=362                                       */
+
+/*ldr r2,= 0x300000100                             */
+
+/*mov pc,#0x30008000                            */
+```
+
+##### 2.2 分析链接脚本arm/arm/kernel/vmlinux.lds
+
+```makefile
+OUTPUT_ARCH(arm)                    //设置输出文件的体系架构
+
+ ENTRY(stext)                          //设置stext全局符号为入口地址
+
+ jiffies = jiffies_64;
+
+SECTIONS
+{
+. = (0xc0000000) + 0x00008000;               
+
+/*设置内核虚拟地址=0xc0000000+0x00008000 */
+.text.head : {
+  _stext = .;
+  _sinittext = .;
+  *(.text.head)         //添加所有.text.head段
+}
+.init : { /* Init code and data                */
+   *(.init.text)
+  _einittext = .;
+  __proc_info_begin = .;
+   *(.proc.info.init)               //存放处理器相关的信息初始化
+  __proc_info_end = .;
+  __arch_info_begin = .;
+   *(.arch.info.init)              //存放与架构(arch)相关的信息(info)初始化
+  __arch_info_end = .;
+...  ...
+```
+
+从vmlinux.lds中得出linux内核启动第一步是进入stext入口函数。那么stext入口函数又在哪里定义的呢？
+
+搜索ENTRY(stext)得出,它在arch/arm/kernel/head.S中，stext函数的在前置条件是：MMU, D-cache, 关闭; r0 = 0, r1 = machine nr, r2 = atags prointer.代码如下:
+
+```assembly
+/*
+
+ * Kernel startup entry point.                      //内核 启动 入口 点
+
+ * ---------------------------
+
+ *
+
+ * This is normally called from the decompressor code.  The requirements
+
+ * are: MMU = off, D-cache = off, I-cache = dont care, r0 = 0,  
+
+/* 前置条件是：MMU, D-cache, 关闭; r0 = 0, r1 =机器ID, r2 =atag参数地址.*/
+
+ * r1 = machine nr.
+
+* This code is mostly position independent, so if you link the kernel at
+
+ * 0xc0008000, you call this at __pa(0xc0008000).
+
+* See linux/arch/arm/tools/mach-types for the complete list of machine
+
+ * numbers for r1.
+
+ *
+
+ * We're trying to keep crap to a minimum; DO NOT add any machine specific
+
+ * crap here - that's what the boot loader (or in extreme, well justified
+
+ * circumstances, zImage) is for.
+
+ */
+
+ section ".text.head", "ax"                      /* 定义一个.text.head段,段的属性a是允许段,x可 执行 */ 
+
+         .type  stext, %function                /*定义了由bootloader进入内核的入口stext */
+
+ENTRY(stext)
+
+... ...
+```
+
+它的功能是获取处理器类型和机器类型信息，并创建临时的页表，然后开启MMU功能(因为内核代码中全是0XCxxxxxxx地址)，并跳进第一个C语言函数start_kernel。所以,内核启动后第一步是 进arch/arm/kernel/head.S的stext函数中.
+
+stext函数如下:
+
+```assembly
+section ".text.head", "ax"                          /* 定义一个.text.head段,段的属性a是允许段,x可 执行 */ 
+
+         .type   stext, %function                     /*定义了由bootloader进入内核的入口stext */
+
+ENTRY(stext)                                    //入口地址stext函数
+
+      /*msr cpsr_c,0xD3   关闭irq和fiq,设置svc管理模式  */
+
+         msr    cpsr_c, #PSR_F_BIT | PSR_I_BIT | SVC_MODE @ ensure svc mode 
+
+                                                          @ and irqs disabled
+
+     /*获取cpu ID */
+
+         mrc    p15, 0, r9, c0, c0              @ get processor id
+
+     /*查找内核是否支持r9这个cpuID，若不支持r5=0，支持r5=处理器ID*/
+
+         bl       __lookup_processor_type             @ r5=procinfo r9=cpuid
+
+         movs  r10, r5                                      @ invalid processor (r5=0)?
+
+      /*不支持则跳转到__error_p,死循环*/
+
+         beq     __error_p                         @ yes, error 'p'
+
+     /*查找内核是否支持uboot传入的r1机器ID(362)，若不支持r5=0，支持r5=机器ID*/
+
+         bl       __lookup_machine_type              @ r5=machinfo
+
+         movs  r8, r5                              @ invalid machine (r5=0)?
+
+     /*不支持则跳转到__error_a,死循环*/
+
+         beq     __error_a                         @ yes, error 'a'
+
+ /*跳转到__create_page_tables 创建页表，为后面的MMU做准备*/
+
+         bl       __create_page_tables
+```
+
+__lookup_machine_type函数”是如何通过查找r1机器ID(362)是或等于单板机器ID的,代码如下(位于arch/arm/kernel)
+
+```assembly
+3:       .long  .
+         .long  __arch_info_begin
+         .long  __arch_info_end
+
+
+__lookup_machine_type:
+
+         /*(b:bank)r3=后面的符号3处. 虚拟地址，由于mmu未启动，所以=物理地址*/
+adr     r3, 3b               
+         ldmia  r3, {r4, r5, r6}/* r4=3b处的虚拟地址 ,r5=__arch_info_begin处的虚拟地址,r6=__arch_info_end处的虚拟地址   */
+         sub     r3, r3, r4                         @ get offset between virt&phys //得到虚拟地址(virtual)与物理地址(physical)的偏移值
+         add     r5, r5, r3                         @ convert virt addresses to  //找到arch_info_begin处的物理地址
+         add     r6, r6, r3                         @ physical address space    //找到__arch_info_end处的物理地址
+1:       ldr      r3, [r5, #MACHINFO_TYPE]      @ get machine type   //r3=r5+偏移地址里内容= 单板机器ID
+         teq     r3, r1                                  //判断r1(365)和单板机器ID是否相等，相等说明内核支持该单板
+         beq     2f                                   @ found   //相等则直接返回到stext函数继续执行
+         add     r5, r5, #SIZEOF_MACHINE_DESC      @ next machine_desc
+         cmp    r5, r6
+
+         blo     1b
+         mov   r5, #0                             @ unknown machine  //r5=0,不支持该单板
+2:       mov   pc, lr                       //退出
+```
+
+其中__arch_info_begin和__arch_info_end是在链接脚本arm/arm/kernel/vmlinux.lds中定义：
+
+```assembly
+305  __arch_info_begin = .;           //__arch_info_begin=信息开始地址
+306     *(.arch.info.init)              //存放架构相关的信息初始化
+307  __arch_info_end = .;           //__arch_info_end =信息结束地址
+```
+
+通过grep “.arch.info.init” -nR其中.arch.info.init段在include/asm-ram/mach/arch.h中53行处定义，代码如下:
+
+```assembly
+#define MACHINE_START(_type,_name)                     //定义了一个MACHINE_START宏, _type:CPU名字,_name:开发板名字
+static const struct machine_desc __mach_desc_##_type \      //##:连词符号
+ __used                                                                \
+ __attribute__((__section__(".arch.info.init"))) = {       \  //强制将  MACHINE_START宏里的成员组成.arch.info.init段
+         .nr               = MACH_TYPE_##_type,          \ 
+         .name           = _name,
+
+
+#define MACHINE_END                               \       //定义宏MACHINE_END=   };
+
+};
+```
+
+搜索MACHINE_START宏发现arch/arm目录下每个文件都使用了这个宏定义，由于我们选用的是S3C2440和SMDKs3c2440,所以得出使用宏#define MACHINE_START(_type,_name)的是：
+
+```c
+MACHINE_START(S3C2440, "SMDK2440")       
+    /* Maintainer: Ben Dooks <ben@fluff.org> */
+    .phys_io  = S3C2410_PA_UART,
+    .io_pg_offst    = (((u32)S3C24XX_VA_UART) >> 18) & 0xfffc,
+    .boot_params  = S3C2410_SDRAM_PA + 0x100,
+7     .init_irq   = s3c24xx_init_irq,
+    .map_io          = smdk2440_map_io,
+    .init_machine  = smdk2440_machine_init,
+  .timer             = &s3c24xx_timer,
+ MACHINE_END
+```
+
+其中上面第1段使用的宏就是之前在arch.h中定义的MACHINE_START(_type,_name),其中_type替换成S3C2440, _name替换成"SMDK2440".第11段的MACHINE_END在被arch.h中定义为等于“};”最终将宏定义代入上面MACHINE_START(S3C2440, "SMDK2440")处的11段代码中,展开如下所示：
+
+```c
+static const struct  machine_desc  __mach_desc_ S3C2440  //定义一个machine_desc型结构体,名字为__mach_desc_ S3C2440
+ __used                                                                \
+ __attribute__((__section__(".arch.info.init"))) = {        //强制将MACHINE_START宏里的成员组成.arch.info.init段
+         .nr               = MACH_TYPE_ S3C2440,  // __mach_desc_ S3C2440.nr= MACH_TYPE_ S3C2440  机器ID
+         .name           = "SMDK2440",              //__mach_desc_ S3C2440. name = "SMDK2440"  机器ID名字   
+
+       /* Maintainer: Ben Dooks <ben@fluff.org> */
+    /*.phys_io  =0X50000000,存放物理IO基地址*/
+       .phys_io  = S3C2410_PA_UART,         
+
+ /* .io_pg_offst存放物理IO偏移地址*/  
+       .io_pg_offst    = (((u32)S3C24XX_VA_UART) >> 18) & 0xfffc,   
+
+        
+
+ 
+
+/*其中S3C2410_SDRAM_PA=0X30000000, .boot_params= 0X30000100,所以我们uboot传入的atag参数地址必须是0X30000100*/
+.boot_params  = S3C2410_SDRAM_PA + 0x100, 
+
+.init_irq = s3c24xx_init_irq,        
+       .map_io          = smdk2440_map_io,     
+       .init_machine  = smdk2440_machine_init,    
+      .timer             = &s3c24xx_timer,   
+  };                                        // MACHINE_END替换成  };
+```
+
+从上面可以看出主要是初始化了machine_desc结构体,然后将其放在.arch.info.init段上,让 内核启动时将uboot传递进来的ID与这个段上的ID进行比较是否吻合,支不支持该单板初始化。
+
+因为不同的单板都有不同MACHINE_START(_type,_name)以及硬件上可能有差别，所以需要初始化的内容也不同
+
+返回stext函数中继续往下看:
+
+```assembly
+ldr   r13, __switch_data             @ address to jump to after
+//MMU使能之后会跳转(jump)到__switch_data@ mmu has been enabled 
+
+adr  lr, __enable_mmu              @ return (PIC) address//使能MMU
+add pc, r10, #PROCINFO_INITFUNC  
+```
+
+为什么使能MMU后会跳转到__switch_data?
+
+在__enable_mmu函数中最后面可以看到使能MMU后，会将r13赋给PC,跳转到了__switch_data,代码如下：
+
+```
+__enable_mmu: 
+      ...  .... 
+      mov    r3, r3
+      mov    r3, r3
+      mov    pc, r13
+```
+
+跳转到了__switch_data中,其中 __switch_data 是__mmap_switched的虚拟地址,所以最终跳转到__mmap_switched中.
+
+__switch_data函数代码如下:
+
+```c
+__switch_data:
+         .long  __mmap_switched                          //进入__mmap_switched函数
+         .long  __data_loc                       @ r4              
+         .long  __data_start                     @ r5
+         .long  __bss_start                      @ r6
+         .long  _end                               @ r7
+         .long                                       @ r4
+         .long  __machine_arch_type                  @ r5
+         .long  cr_alignment                         @ r6
+         .long  init_thread_union + THREAD_START_SP @ sp
+
+__mmap_switched:
+         adr     r3, __switch_data + 4           //r3=__data_loc段内容
+/*其中
+__data_loc 是数据存放的位置
+__data_start 是数据开始的位置    
+__bss_start 是bss开始的位置
+_end 是bss结束的位置, 也是内核结束的位置
+这几个符号都在arch/arm/kernel/vmlinux.lds中定义的变量
+*/
+
+         ldmia  r3!, {r4, r5, r6, r7}   //r4=__data_loc ,  r5=__data_start ,  r6=__bss_start ，r7=_end ,  r3= processor_id
+         cmp    r4, r5                                        // __data_loc段不等于__data_start段则执行下面1处的内容
+1:       cmpne  r5, r6                  // 比较r5(__data_start段)和r6(__bss_start段)
+         ldrne   fp, [r4], #4                
+         strne   fp, [r5], #4                //str r4,[r5] 将整个段里内容从 __data_loc段 复制到__data_start段
+         bne     1b                      //r5不等于r6，则继续复制   
+
+         mov   fp, #0                             @ Clear BSS (and zero fp)  //清除bss段
+1:       cmp    r6, r7                   //比较r6(__bss_start t段)和r7(_end段)
+         strcc   fp, [r6],#4               // 清除bss段
+         bcc     1b                     //(cc:小于)r6<r7,继续清除bss段 
+
+         ldmia  r3, {r4, r5, r6, sp}       //r4=r3= processor_id, r5=__machine_arch_type,r6= cr_alignment,
+//设置栈sp= init_thread_union + THREAD_START_SP,方便执行C函数start_kernel
+         str      r9, [r4]                            @ Save processor ID
+         str      r1, [r5]                            @ Save machine type
+         bic     r4, r0, #CR_A                           @ Clear 'A' bit
+         stmia  r6, {r0, r4}                      @ Save control register values
+
+         b        start_kernel                   //然后执行start_kernel函数 
+```
+
+最终跳到start_kernel函数，此函数代码用纯C来实现，它会调用各个平台的相关初始化函数
+
+#### 3. start_kernel函数分析
+
+```c
+asmlinkage void __init start_kernel(void) 
+
+{ 
+  char * command_line; 
+  extern struct kernel_param __start___param[], __stop___param[];  
+
+  smp_setup_processor_id();  //来设置smp process id，当然目前看到的代码里面这里是空的
+  
+  unwind_init(); 
+
+//lockdep是linux内核的一个调试模块，用来检查内核互斥机制尤其是自旋锁潜在的死锁问题。  
+//自旋锁由于是查询方式等待，不释放处理器，比一般的互斥机制更容易死锁，  
+//故引入lockdep检查以下几种情况可能的死锁（lockdep将有专门的文章详细介绍，在此只是简单列举）：  
+//  
+//·同一个进程递归地加锁同一把锁；  
+//  
+//·一把锁既在中断（或中断下半部）使能的情况下执行过加锁操作，  
+// 又在中断（或中断下半部）里执行过加锁操作。这样该锁有可能在锁定时由于中断发生又试图在同一处理器上加锁；  
+//  
+//·加锁后导致依赖图产生成闭环，这是典型的死锁现象。  
+   lockdep_init(); 
+   
+
+//关闭当前CUP中断  
+local_irq_disable(); 
+
+//修改标记early_boot_irqs_enabled;  
+//通过一个静态全局变量 early_boot_irqs_enabled来帮助我们调试代码，  
+//通过这个标记可以帮助我们知道是否在”early bootup code”，也可以通过这个标志警告是有无效的终端打开  
+early_boot_irqs_off(); 
+
+//每一个中断都有一个IRQ描述符（struct irq_desc）来进行描述。  
+//这个函数的主要作用是设置所有的 IRQ描述符（struct irq_desc）的锁是统一的锁，  
+//还是每一个IRQ描述符（struct irq_desc）都有一个小锁。  
+early_init_irq_lock_class(); 
+
+ 
+
+
+/*
+
+ * Interrupts are still disabled. Do necessary setups, then
+ * enable them
+ */ 
+// 大内核锁（BKL--Big Kernel Lock）  
+//大内核锁本质上也是自旋锁，但是它又不同于自旋锁，自旋锁是不可以递归获得锁的，因为那样会导致死锁。  
+//但大内核锁可以递归获得锁。大内核锁用于保护整个内核，而自旋锁用于保护非常特定的某一共享资源。  
+//进程保持大内核锁时可以发生调度，具体实现是：  
+//在执行schedule时，schedule将检查进程是否拥有大内核锁，如果有，它将被释放，以致于其它的进程能够获得该锁，  
+//而当轮到该进程运行时，再让它重新获得大内核锁。注意在保持自旋锁期间是不运行发生调度的。  
+//需要特别指出，整个内核只有一个大内核锁，其实不难理解，内核只有一个，而大内核锁是保护整个内核的，当然有且只有一个就足够了。  
+//还需要特别指出的是，大内核锁是历史遗留，内核中用的非常少，一般保持该锁的时间较长，因此不提倡使用它。  
+//从2.6.11内核起，大内核锁可以通过配置内核使其变得可抢占（自旋锁是不可抢占的），这时它实质上是一个互斥锁，使用信号量实现。  
+//大内核锁的API包括：  
+//  
+//void lock_kernel(void);  
+//  
+//该函数用于得到大内核锁。它可以递归调用而不会导致死锁。  
+//  
+//void unlock_kernel(void);  
+//  
+//该函数用于释放大内核锁。当然必须与lock_kernel配对使用，调用了多少次lock_kernel，就需要调用多少次unlock_kernel。  
+//大内核锁的API使用非常简单，按照以下方式使用就可以了：  
+//lock_kernel(); //对被保护的共享资源的访问 … unlock_kernel()；  
+//http://blog.csdn.net/universus/archive/2010/05/25/5623971.aspx  
+  lock_kernel(); 
+
+ 
+//初始化time ticket，时钟  
+  tick_init(); 
+
+ 
+
+//函数 tick_init() 很简单，调用 clockevents_register_notifier 函数向 clockevents_chain 通知链注册元素：  
+// tick_notifier。这个元素的回调函数指明了当时钟事件设备信息发生变化（例如新加入一个时钟事件设备等等）时，  
+//应该执行的操作，该回调函数为 tick_notify   
+//http://blogold.chinaunix.net/u3/97642/showart_2050200.html  
+  boot_cpu_init();
+
+  
+
+//初始化页地址，当然对于arm这里是个空函数  
+//http://book.chinaunix.net/special/ebook/PrenticeHall/PrenticeHallPTRTheLinuxKernelPrimer/0131181637/ch08lev1sec5.html  
+  page_address_init(); 
+
+  
+
+/*打印KER_NOTICE,这里的KER_NOTICE是字符串<5>*/
+  printk(KERN_NOTICE);
+
+ 
+
+ 
+
+/*打印以下linux版本信息:       
+“Linux version 2.6.22.6 (book@book-desktop) (gcc version 3.4.5) #1 Fri Jun 16 00:55:53 CST 2017” */
+ printk(linux_banner);
+      
+
+//系结构相关的内核初始化过程,处理uboot传递进来的atag参数( setup_memory_tags()和setup_commandline _tags() )  
+//http://www.cublog.cn/u3/94690/showart_2238008.html  
+setup_arch(&command_line); 
+
+  
+
+//处理启动命令，这里就是设置的cmd_line，
+//保存未改变的comand_line到字符数组static_command_line［］ 中。
+//保存  boot_command_line到字符数组saved_command_line［］中  
+setup_command_line(command_line); 
+
+unwind_setup();
+
+//如果没有定义CONFIG_SMP宏，则这个函数为空函数。  
+//如果定义了CONFIG_SMP宏，则这个setup_per_cpu_areas()函数给每个CPU分配内存，  
+//并拷贝.data.percpu段的数据。为系统中的每个CPU的per_cpu变量申请空间。  
+setup_per_cpu_areas();
+
+//定义在include/asm-x86/smp.h。  
+//如果是SMP环境，则设置boot CPU的一些数据。在引导过程中使用的CPU称为boot CPU  
+smp_prepare_boot_cpu(); 
+
+/* arch-specific boot-cpu hooks */ 
+/* 进程调度器初始化 */
+sched_init(); 
+
+/* 禁止内核抢占 */  
+preempt_disable();
+      
+//设置node 和 zone 数据结构  
+//内存管理的讲解：http://blog.chinaunix.net/space.php?uid=361890&do=blog&cuid=2146541  
+build_all_zonelists(NULL); 
+ 
+//初始化page allocation相关结构  
+page_alloc_init();
+
+/* 打印Linux启动命令行参数 */   
+printk(KERN_NOTICE "Kernel command line: %s/n", boot_command_line); 
+  
+//解析内核参数  
+//对内核参数的解析：http://hi.baidu.com/yuhuntero/blog/item/654a7411e45ce519b8127ba9.html  
+parse_early_param(); 
+parse_args("Booting kernel", static_command_line, __start___param, 
+  __stop___param - __start___param, 
+  &unknown_bootoption); 
+
+/*
+* These use large bootmem allocations and must precede
+* kmem_cache_init()
+*/ 
+//初始化hash表，以便于从进程的PID获得对应的进程描述指针，按照实际的物理内存初始化pid hash表  
+//这里涉及到进程管理http://blog.csdn.net/satanwxd/archive/2010/03/27/5422053.aspx  
+pidhash_init(); 
+
+//初始化VFS的两个重要数据结构dcache和inode的缓存。  
+//http://blog.csdn.net/yunsongice/archive/2011/02/01/6171324.aspx  
+vfs_caches_init_early(); 
+
+//把编译期间，kbuild设置的异常表，也就是__start___ex_table和__stop___ex_table之中的所有元素进行排序  
+sort_main_extable(); 
+
+//初始化中断向量表  
+//http://blog.csdn.net/yunsongice/archive/2011/02/01/6171325.aspx  
+trap_init(); 
+
+//memory map初始化  
+//http://blog.csdn.net/huyugv_830913/archive/2010/09/15/5886970.aspx  
+mm_init(); 
+
+/*
+* Set up the scheduler prior starting any interrupts (such as the
+* timer interrupt). Full topology setup happens at smp_init()
+* time - but meanwhile we still have a functioning scheduler.
+*/ 
+//核心进程调度器初始化，调度器的初始化的优先级要高于任何中断的建立，  
+//并且初始化进程0，即idle进程，但是并没有设置idle进程的NEED_RESCHED标志，  
+//所以还会继续完成内核初始化剩下的事情。  
+//这里仅仅为进程调度程序的执行做准备。  
+//它所做的具体工作是调用init_bh函数(kernel/softirq.c)把timer,tqueue,immediate三个人物队列加入下半部分的数组  
+sched_init(); 
+
+/*
+* Disable preemption - early bootup scheduling is extremely
+* fragile until we cpu_idle() for the first time.
+*/ 
+//抢占计数器加1   
+ preempt_disable();
+
+ 
+
+//检查中断是否打开,如果已经打开，则关闭中断   
+  if (!irqs_disabled()) { 
+  printk(KERN_WARNING "start_kernel(): bug: interrupts were " 
+  "enabled *very* early, fixing it/n"); 
+  local_irq_disable(); 
+  } 
+
+ 
+
+  sort_main_extable(); 
+ /*
+ * trap_init函数完成对系统保留中断向量（异常、非屏蔽中断以及系统调用）              
+ * 的初始化，init_IRQ函数则完成其余中断向量的初始化
+ */
+ trap_init();    
+
+//Read-Copy-Update的初始化  
+//RCU机制是Linux2.6之后提供的一种数据一致性访问的机制，  
+//从RCU（read-copy-update）的名称上看，我们就能对他的实现机制有一个大概的了解，  
+//在修改数据的时候，首先需要读取数据，然后生成一个副本，对副本进行修改，  
+//修改完成之后再将老数据update成新的数据，此所谓RCU。  
+//http://blog.ednchina.com/tiloog/193361/message.aspx  
+//http://blogold.chinaunix.net/u1/51562/showart_1341707.html  
+rcu_init();
+ 
+//初始化IRQ中断和终端描述符。  
+//初始化系统中支持的最大可能的中断描述结构struct irqdesc变量数组irq_desc[NR_IRQS],  
+//把每个结构变量irq_desc[n]都初始化为预先定义好的坏中断描述结构变量bad_irq_desc,  
+//并初始化该中断的链表表头成员结构变量pend  
+init_IRQ();    
+
+/* 初始化hash表，便于从进程的PID获得对应的进程描述符指针 */
+pidhash_init();
+
+ 
+
+//初始化定时器Timer相关的数据结构  
+//http://www.ibm.com/developerworks/cn/linux/l-cn-clocks/index.html  
+init_timers();  
+
+//对高精度时钟进行初始化  
+hrtimers_init();
+ 
+//软中断初始化  
+//http://blogold.chinaunix.net/u1/51562/showart_494363.html  
+softirq_init(); 
+ 
+//初始化时钟源  
+timekeeping_init(); 
+ 
+//初始化系统时间，  
+//检查系统定时器描述结构struct sys_timer全局变量system_timer是否为空，  
+//如果为空将其指向dummy_gettimeoffset()函数。  
+//http://www.ibm.com/developerworks/cn/linux/l-cn-clocks/index.html  
+time_init();  
+
+//profile只是内核的一个调试性能的工具，  
+//这个可以通过menuconfig中的Instrumentation Support->profile打开。  
+//http://www.linuxdiyf.com/bbs//thread-71446-1-1.html  
+profile_init();
+    
+/*if判断中断是否打开,如果已经打开，打印数据*/   
+if (!irqs_disabled()) 
+    printk(KERN_CRIT "start_kernel(): bug: interrupts were enabled early/n"); 
+
+//与开始的early_boot_irqs_off相对应  
+early_boot_irqs_on(); 
+ 
+//与local_irq_disbale相对应，开CPU中断  
+local_irq_enable();
+
+/*
+* HACK ALERT! This is early. We're enabling the console before
+* we've done PCI setups etc, and console_init() must be aware of
+* this. But we do want output early, in case something goes wrong.
+*/ 
+//初始化控制台以显示printk的内容，在此之前调用的printk，只是把数据存到缓冲区里，  
+//只有在这个函数调用后，才会在控制台打印出内容  
+//该函数执行后可调用printk()函数将log_buf中符合打印级别要求的系统信息打印到控制台上。  
+console_init(); 
+
+if (panic_later) 
+panic(panic_later, panic_param);  
+
+//如果定义了CONFIG_LOCKDEP宏，那么就打印锁依赖信息，否则什么也不做  
+lockdep_info(); 
+
+/*
+* Need to run this when irqs are enabled, because it wants
+* to self-test [hard/soft]-irqs on/off lock inversion bugs
+* too:
+*/ 
+//如果定义CONFIG_DEBUG_LOCKING_API_SELFTESTS宏  
+//则locking_selftest()是一个空函数，否则执行锁自测  
+ locking_selftest(); 
+
+  
+
+#ifdef CONFIG_BLK_DEV_INITRD  
+if (initrd_start && !initrd_below_start_ok && 
+   page_to_pfn(virt_to_page((void *)initrd_start)) < min_low_pfn) { 
+printk(KERN_CRIT "initrd overwritten (0x%08lx < 0x%08lx) - " 
+   "disabling it./n", 
+   page_to_pfn(virt_to_page((void *)initrd_start)), 
+   min_low_pfn); 
+initrd_start = 0; 
+} 
+#endif
+
+ 
+ /* 虚拟文件系统的初始化 */
+ vfs_caches_init_early();       
+ cpuset_init_early();
+ mem_init();
+
+/* slab初始化 */
+kmem_cache_init();  
+
+//是否是对SMP的支持，单核是否需要？？这个要分析  
+setup_per_cpu_pageset(); 
+
+numa_policy_init(); 
+
+if (late_time_init) 
+   late_time_init(); 
+
+//calibrate_delay（）函数可以计算出cpu在一秒钟内执行了多少次一个极短的循环，  
+//计算出来的值经过处理后得到BogoMIPS 值，  
+//Bogo是Bogus(伪)的意思，MIPS是millions of instructions per second(百万条指令每秒)的缩写。  
+//这样我们就知道了其实这个函数是linux内核中一个cpu性能测试函数。  
+//http://blogold.chinaunix.net/u2/86768/showart_2196664.html  
+calibrate_delay();
+   
+//PID是process id的缩写  
+//http://blog.csdn.net/satanwxd/archive/2010/03/27/5422053.aspx  
+pidmap_init();
+
+ /* 接下来的函数中，大多数都是为有关的管理机制建立专用的slab缓存 */ 
+pgtable_cache_init();
+ 
+/* 初始化优先级树index_bits_to_maxindex数组 */
+prio_tree_init();          
+
+//来自mm/rmap.c  
+//分配一个anon_vma_cachep作为anon_vma的slab缓存。  
+//这个技术是PFRA（页框回收算法）技术中的组成部分。  
+//这个技术为定位而生——快速的定位指向同一页框的所有页表项。  
+anon_vma_init();
+
+    
+#ifdef CONFIG_X86  
+if (efi_enabled) 
+efi_enter_virtual_mode(); 
+#endif 
+
+//根据物理内存大小计算允许创建进程的数量  
+//http://www.jollen.org/blog/2006/11/jollen_linux_3_fork_init.html  
+fork_init(totalram_pages);
+
+   
+//给进程的各种资源管理结构分配了相应的对象缓存区  
+//http://www.shangshuwu.cn/index.php/Linux内核的进程创建  
+proc_caches_init(); 
+
+//创建 buffer_head SLAB 缓存  
+buffer_init(); 
+
+unnamed_dev_init();
+
+//初始化key的management stuff  
+key_init(); 
+
+//关于系统安全的初始化，主要是访问控制  
+//http://blog.csdn.net/nhczp/archive/2008/04/29/2341194.aspx  
+security_init();  
+
+//调用kmem_cache_create()函数来为VFS创建各种SLAB分配器缓存  
+//包括：names_cachep、filp_cachep、dquot_cachep和bh_cachep等四个SLAB分配器缓存  
+vfs_caches_init(totalram_pages); 
+ 
+radix_tree_init(); 
+
+//创建信号队列  
+signals_init();
+
+   
+
+/* rootfs populating might need page-writeback */ 
+//回写相关的初始化  
+//http://blog.csdn.net/yangp01/archive/2010/04/06/5454822.aspx  \
+page_writeback_init();   
+
+#ifdef CONFIG_PROC_FS  
+   proc_root_init(); 
+#endif  
+
+//http://blogold.chinaunix.net/u1/51562/showart_1777937.html  
+cpuset_init();
+ 
+////进程状态初始化，实际上就是分配了一个存储线程状态的高速缓存  
+taskstats_init_early(); 
+
+delayacct_init();  
+
+//测试CPU的各种缺陷，记录检测到的缺陷，以便于内核的其他部分以后可以使用他们工作。  
+check_bugs(); 
+ 
+//电源相关的初始化  
+//http://blogold.chinaunix.net/u/548/showart.php?id=377952  
+acpi_early_init(); /* before LAPIC and SMP init */ 
+ 
+
+//接着进入rest_init()创建init进程,创建根文件系统，启动应用程序
+rest_init(); 
+}
+```
+
+```c
+static void noinline __init_refok rest_init(void)
+{
+    int pid;
+    /*创建init进程，然后进入kernel_init()*/
+       kernel_thread(kernel_init, NULL, CLONE_FS | CLONE_SIGHAND);
+    ... ...
+}
+```
+
+#### 4. 分析内核挂载根文件
+
+##### 4.1 首先进入stext函数启动内核
+
+```assembly
+ENTRY(stext):         
+
+... ...                           //启动内核
+
+b start_kernel                    //跳转start_kernel()
+```
+
+##### 4.2 然后进入start_kernel()初始化
+
+```c
+asmlinkage void __init start_kernel(void)
+{
+   ...
+   setup_arch(&command_line);           //解析uboot传入的启动参数
+   setup_command_line(command_line);    //解析uboot传入的启动参数
+   ....
+   /*查找内核参数*/
+   parse_early_param()
+   {
+     do_early_param()；              //从__setup_start到__setup_end查找early非0的函数,后面会分析
+   } 
+   /*查找内核参数*/
+   unknown_bootoption()                 
+   {
+     obsolete_checksetup();      //从__setup_start到__setup_end查找early为0的函数,后面会分析
+   }
+   ...
+   rest_init();                                //进入rest_init()
+}
+```
+
+##### 4.3 进入rest_init()启动init进程
+
+```c
+static void noinline __init_refok rest_init(void)
+{
+   kernel_thread(kernel_init, NULL, CLONE_FS | CLONE_SIGHAND);  //启动init进程，然后进入kernel_init中启动应用程序
+   ... ...
+}
+```
+
+##### 4.4 kernel_init分析
+
+```c
+static int __init kernel_init(void * unused)                             
+{
+   ... ...
+   prepare_namespace()              //进入prepare_namespace函数,挂载系统
+   {
+       ... ...      //通过解析出来的命令行参数” root=/dev/mtdblock3”来挂接根文件系统 mount_root();   //开始挂载
+   } 
+  init_post()                               //进入init_post() 函数,运行应用程序
+  {
+      /*   打开dev/console,并提供输入、输出、错误提示    */
+      if (sys_open((const char __user *) "/dev/console", O_RDWR, 0) < 0)   
+      printk(KERN_WARNING "Warning: unable to open an initial console.\n");
+       (void) sys_dup(0);
+       (void) sys_dup(0);
+         ... ...     
+       run_init_process("/sbin/init");        //执行应用程序
+       run_init_process("/etc/init");         //执行应用程序
+       run_init_process("/bin/init");        //执行应用程序
+       run_init_process("/bin/sh");         //执行应用程序
+}
+```
+
+##### 4.5 prepare_namespace()函数分析
+
+如何挂接root=/dev/mtdblock3
+
+```c
+void __init prepare_namespace(void)
+{
+ ... ...
+if (saved_root_name[0]) //判断saved_root_name[0]数组是否为空
+{
+root_device_name = saved_root_name;       
+if (!strncmp(root_device_name, "mtd", 3)) {     //比较root_device_name数组是否已mtd开头？
+  mount_block_root(root_device_name, root_mountflags);
+  goto out; }                              //是mtd，则跳转到out,直接挂载
+   
+ROOT_DEV = name_to_dev_t(root_device_name);
+if (strncmp(root_device_name, "/dev/", 5) == 0) //比较是不是已/dev/开头
+root_device_name += 5;                 //是的话，+5找到mtd开头
+}
+
+is_floppy = MAJOR(ROOT_DEV) == FLOPPY_MAJOR;
+if (initrd_load())
+goto out;
+if (is_floppy && rd_doload && rd_load_disk(0))
+ROOT_DEV = Root_RAM0;
+mount_root();       //将实际文件系统挂载到rootfs的/root目录
+ 
+out:
+       sys_mount(".", "/", NULL, MS_MOVE, NULL);
+       sys_chroot(".");
+       security_sb_post_mountroot();
+}
+```
+
+从上面代码得出,saved_root_name数组通过名字可以得出，是用来保存root文件系统的名字” /dev/mtdblock3”.
+
+##### 4.6 bootags参数又是怎么保存到数组的呢?,通过搜索”saved_root_name”,找到如下代码
+
+```c
+static int __init root_dev_setup(char *line)
+{
+    strlcpy(saved_root_name, line, sizeof(saved_root_name));        //复制saved_root_name数组
+    return 1;
+}
+
+__setup("root=", root_dev_setup);
+```
+
+其中root_dev_setup()函数是用来将line数组中的数据统统复制到saved_root_name数组中
+
+__setup("root=", root_dev_setup);中有”root=”,猜测下，这个估计就是用来匹配命令行中以”root=”开头的字符串，然后再将” root=/dev/mtdblock3”中的”/dev/mtdblock3”放在saved_root_name数组中
+
+##### 4.7 接下来分析上面的__setup("root=", root_dev_setup)宏定义
+
+我们搜索__setup宏，找到它在include/linux/init.h中定义:
+
+```c
+#define __setup_param(str, unique_id, fn, early)          \    //定义__setup_param(str, unique_id, fn, early)
+/*定义字符串数组__setup_str_##unique_id[]=str; \表示还在define中     */
+static char __setup_str_##unique_id[] __initdata = str;    \      //相当于: __setup_str_ root_dev_setup[]="root="   
+/*定义结构体obs_kernel_param型__setup_##unique_id*/
+static struct  obs_kernel_param  __setup_##unique_id\             
+               __attribute_used__                                   \
+                   __attribute__((__section__(".init.setup")))        \    //设置.init.setup段
+                   __attribute__((aligned((sizeof(long)))))    \
+                   = { __setup_str_##unique_id, fn, early }   //将"root=",root_dev_setup,0 放在 .init.setup段中
+
+ 
+
+#define __setup(str, fn)                   \        //定义__setup(str, fn)使用__setup_param(str, fn, fn, 0)
+          __setup_param(str, fn, fn, 0)
+```
+
+最终__setup("root=", root_dev_setup)宏= { __setup_str_ root_dev_setup[], root_dev_setup , 0 };
+
+在.init.setup段中存放了3个成员，第一个成员是字符串数组等于”root=”,第二个成员是一个函数,第三个成员early=0；
+
+其中.init.setup段在vmlinux.lds中使用(.init.setup段用于存放特殊的内容,比如命令行参数).
+
+vmlinux.lds部分代码如下:
+
+```assembly
+311   . = ALIGN(16);
+312   __setup_start = .;
+313    *(.init.setup)                 //存放.init.setup段
+314   __setup_end = .;
+```
+
+##### 4.8 分析宏__setup("root=", root_dev_setup);又是怎么被调用的
+
+由于通过宏”__setup("root=", root_dev_setup);”最终被存在了.init.setup段里，
+
+所以首先搜索”__setup_start”，发现在init/main.c中do_early_param函数和obsolete_checksetup函数都使用了它
+
+搜索do_early_param，发现它被parse_early_param()函数调用,如下图：
+
+![](../../../../../img/嵌入式linux/parse_early_param-1.png)
+
+然后搜索parse_early_param(),发现它在start_kernel函数中使用,如下图:
+
+![](../../../../../img/嵌入式linux/parse_early_param-2.png)
+
+得出:在内核启动start_kernel()中会处理这个do_early_param函数.
+
+```c
+//do_early_param源码
+static int __init do_early_param(char *param, char *val)
+{
+struct obs_kernel_param  *p;                //定义obs_kernel_param结构体指针*p
+for (p = __setup_start; p < __setup_end; p++)   //查找.init.setup段的内容
+{if (p->early && strcmp(param, p->str) == 0) {  
+       if (p->setup_func(val) != 0)                //处理early非0的函数
+           printk(KERN_WARNING
+           "Malformed early option '%s'\n", param); 
+}}
+}
+```
+
+上面obs_kernel_param的结构体定义如下，刚好对应了
+
+```c
+struct obs_kernel_param {
+         const char *str;                //__setup_str_ root_dev_setup[]=”root=”
+         int (*setup_func)(char *);        // root_dev_setup(char *line)
+         int early;                     // early=0
+};
+```
+
+__setup("root=", root_dev_setup)宏= { __setup_str_ root_dev_setup[], root_dev_setup , 0 }中的3个成员。
+
+由于__setup("root=", root_dev_setup)的early=0,所以if (p->early && strcmp(param, p->str) == 0)永远不成立.
+
+所以在内核启动strat_kernel()函数中会通过do_early_param函数是处理early不为0的函数。
+
+##### 4.9 obsolete_checksetup函数
+
+搜索obsolete_checksetup，发现它被unknown_bootoption ()函数调用:
+
+![](../../../../../img/嵌入式linux/obsolete_checksetup-1.png)
+
+然后搜索unknown_bootoption (),发现它在start_kernel函数中使用, 如下图:
+
+![](../../../../../img/嵌入式linux/obsolete_checksetup-2.png)
+
+得出:在内核启动start_kernel()中会处理这个do_early_param函数.
+
+```c
+static int __init obsolete_checksetup(char *line)
+{
+struct obs_kernel_param *p;         //定义obs_kernel_param型结构体指针
+int had_early_param = 0;
+  p = __setup_start;
+do {
+         int n = strlen(p->str);
+         if (!strncmp(line, p->str, n))            //确定是否有内容
+        {
+         if (p->early) {                          //early非0,则不执行函数         
+                   if (line[n] == '\0' || line[n] == '=')
+                   had_early_param = 1;
+                            }
+          else if (!p->setup_func) {                //  处理early为0的函数，
+                                     printk(KERN_WARNING "Parameter %s is obsolete,"
+                                            " ignored\n", p->str);
+                                        return 1; }
+
+           else if (p->setup_func(line + n))             //处理early为0的函数
+                                     return 1;
+         }
+                  p++;
+   } while (p < __setup_end);        //从__setup_start到__setup_end查找
+         return had_early_param;
+}
+```
+
+##### 4.10 root=/dev/mtdblock3 分析:
+
+在flash中没有分区表，在内核中,mtdblock3又在哪里体现出来的？和uboot一样，它也是在内核代码中已经写好了的，在内核中可以通过启动内核,从串口上可以看到分区表,如下图:
+
+![](../../../../../img/嵌入式linux/partion-1.png)
+
+从上面得出,在flash中定义了4大分区:
+bootloader :存放u-boot 
+boot parameters :存放一些可以设置的参数,供u-boot使用
+kernel :存放内核区
+root filesystem  :根文件系统,挂载(mount)后才能使用文件系统中的应用程序
+
+在linux-2.6.22.6目录下通过 grep "\"bootloader\"" * -nR 搜索分区代码,如下图
+
+![](../../../../../img/嵌入式linux/partion-2.png)
+
+由于使用的是ARM架构,CPU2440,所以找到上面红线处的行, 才是我们需要的。
+
+然后进入arch/arm/plat-s3c24xx/common-smdk.c中，找到120行,代码如下:
+
+```c
+static struct mtd_partition smdk_default_nand_part[] = {
+ [0] = {                                      // mtdblock0
+     .name   = "bootloader",
+     .size   = 0x00040000,
+     .offset         = 0,
+         },
+
+[1] = {                                      // mtdblock1
+     .name   = "params",
+     .offset = MTDPART_OFS_APPEND,  //表示紧跟着前面的地址后面,为偏移地址,= 0x00040000
+     .size   = 0x00020000,
+         },
+
+[2] = {                                     // mtdblock2
+     .name   = "kernel",
+     .offset = MTDPART_OFS_APPEND, //表示紧跟着前面的地址后面,为偏移地址,= 0x00060000
+     .size   = 0x00200000,
+         },
+
+[3] = {                                     // mtdblock3
+     .name   = "root",
+     .offset = MTDPART_OFS_APPEND, //表示紧跟着前面的地址后面,为偏移地址,= 0x00260000
+     .size   = MTDPART_SIZ_FULL,
+         }
+
+};
+```
+
+#### 5. 启动第一个应用程序
+
+内核挂接到根文件系统后，会开始启动第一个应用程序(init进程):
+
+kernel_init函数代码如下:
+
+```c
+static int __init kernel_init(void * unused)    //进入init进程                             
+{    
+   prepare_namespace()  //挂载根文件系统
+   {
+     ... ...      / /通过解析出来的命令行参数” root=/dev/mtdblock3”来挂接根文件系统 mount_root();   //开始挂载
+   }
+
+   init_post();           //启动应用程序     
+}
+```
+
+init_post函数代码如下:
+
+```c
+static int noinline init_post(void)
+{
+  /*内核已经初始化完成,所以清除__init_begin段到__init_end段之间的数据*/
+       free_initmem();
+       unlock_kernel();
+       mark_rodata_ro();
+       system_state = SYSTEM_RUNNING;
+       numa_default_policy(); 
+
+/*  打开dev/console控制台设备(串口0),使用户能输入信息, /dev/console即成为kernel_init进程的标准输入源（文件描述符0）,
+   打开失败则打印Warning: unable to open an initial console.\n   */
+       if (sys_open((const char __user *) "/dev/console", O_RDWR, 0) < 0)
+              printk(KERN_WARNING "Warning: unable to open an initial console.\n");
+```
+
+当我们擦除根文件系统的内容再启动内核，发现串口就会打印上面的字符串,如下图:
+
+![](../../../../../img/嵌入式linux/init_post.png)
+
+会显示打开dev/console失败，是因为根文件系统还是在root=/dev/mtdblock3, 所以能挂载根文件系统,我们擦除了mtd3内容,也就是dev里面的内容,所以无法打开console控制台。 
+
+```c
+/*调用dup打开/dev/console文件描述符两次, 该控制台设备就也可以供标准输出和标准错误使用（文件描述符1和2），
+kernel_init进程现在就拥有3个文件描述符--标准输入、标准输出以及标准错误。*/
+    (void) sys_dup(0);
+    (void) sys_dup(0);
+   
+  if (ramdisk_execute_command) {       //若 ramdisk_execute_command为0,不运行它
+         run_init_process(ramdisk_execute_command);  
+         printk(KERN_WARNING "Failed to execute %s\n",
+          ramdisk_execute_command); }
+```
+
+搜索上面ramdisk_execute_command,发现它是一个char型全局数组,找到它被用在init_setup()中,代码如下:
+
+```c
+static int __init rdinit_setup(char *str)
+{
+         unsigned int i;
+  
+   /* 使ramdisk_execute_command数组等于str  *、
+         ramdisk_execute_command = str;     
+
+         /* See "auto" comment in init_setup */
+         for (i = 1; i < MAX_INIT_ARGS; i++)
+                   argv_init[i] = NULL;
+         return 1;
+}
+
+__setup("rdinit=", rdinit_setup);
+
+ramdisk_execute_command
+```
+
+发现上面__setup和我们上节分析的挂载根文件系统的__setup都是一样的
+
+它是匹配命令行中以” rdinit=”开头的字符串,由于我们uboot的命令行参数中没有”rdint=”，所以ramdisk_execute_command=0,不执行if判断
+
+```c
+if (execute_command) {   // execute_command不为0, 运行它
+
+/* run_init_process 运行目标程序成功后会一直死循环*/          
+run_init_process(execute_command);  
+
+/*run_init_process运行失败退出后,打印Failed to execute /linuxrc.  Attempting defaults...  */
+              printk(KERN_WARNING "Failed to execute %s.  Attempting "
+                                   "defaults...\n", execute_command);
+                      }
+```
+
+搜索上面execute_command,发现它是一个char型全局数组,找到它被用在init_setup()中,代码如下:
+
+```c
+static int __init init_setup(char *str)
+{
+       unsigned int i;
+ 
+     /*execute_command =str*/
+       execute_command = str;     
+       for (i = 1; i < MAX_INIT_ARGS; i++)
+        argv_init[i] = NULL;
+       return 1;
+}
+__setup("init=", init_setup);
+
+execute_command
+```
+
+发现上面__setup和我们上节分析的挂载根文件系统的__setup都是一样的
+
+显然这里就是用来匹配命令行中以” init=”开头的字符串，然后再将命令行参数bootargs中的” init=/linuxrc”中的” /linuxrc”放在execute_command数组中.
+
+(init=/linuxrc:指定内核启动后运行的第一个脚本是当前目录下linuxrc脚本)   
+
+最终__setup("init=", init_setup)宏= { __setup_str_ root_dev_setup[], root_dev_setup , 0 };
+
+然后放在.init.setup段中,在内核启动后进入start_kernel()函数中使用这个宏，并将” /linuxrc”放在execute_command数组中.
+
+当文件系统被擦除后,就会运行linuxrc应用程序失败,打印执行linuxrc失败,如下图:
+
+![](../../../../../img/嵌入式linux/init_post-1.png)
+
+```c
+/*运行应用程序失败后,从下面3个地方查找可能出现 init应用程序的所有地方*/
+       run_init_process("/sbin/init");
+       run_init_process("/etc/init");
+       run_init_process("/bin/init");
+
+ 
+
+/*试图建立/bin/sh 来代替应用程序 */
+       run_init_process("/bin/sh");
+
+
+  /*如上图所示，当前面的所有情况都失败时，调用panic。这样内核就会试图同步磁盘，确保其状态一致。
+     如果超过了内核选项中定义的时间，它也可能会重新启动机器。*/
+       panic("No init found.  Try passing init= option to kernel.");
+
+}
+```
+
+在这里init_post函数就分析完毕了
+
+当在内核中,能输入数据时,表示根文件系统的应用程序启动完毕
+
+![](../../../../../img/嵌入式linux/init_post-2.png)
+
